@@ -168,6 +168,46 @@ Pour les méthodes Invoke à exposer : si l'utilisateur n'en demande pas explici
 proposer 2-3 pertinentes selon ce que fait l'app (ex: `GetStatus`, `GetLastEvent`, etc.)
 ou laisser pour plus tard avec un commentaire `// TODO: RegisterInvokeHandler<...>`.
 
+#### (v1.3) Hooks shutdown négocié — `IWpsModule`
+
+Depuis le contrat **v1.3** (juin 2026), proposer **systématiquement** au moins
+`OnCanCloseRequestedAsync` quand l'app a un cleanup applicatif au shutdown (flush, ABM_REMOVE,
+sauvegarde, fermeture d'une connexion BDD, etc.). Le pattern recommandé est d'exécuter le
+cleanup **proactivement** avant de répondre `Ok` :
+
+```csharp
+public partial class App : Application, IWpsModule
+{
+    public ValueTask<CanCloseDecision> OnCanCloseRequestedAsync(CanCloseContext ctx)
+    {
+        // Cleanup synchrone rapide ICI (avant de répondre Ok au host)
+        MyCleanup.RunSync();
+        return new ValueTask<CanCloseDecision>(CanCloseDecision.Ok);
+    }
+
+    public void OnShutdownRequested() => Application.Current?.Shutdown();
+
+    public void OnHostDisconnected(HostDisconnectReason reason)
+    {
+        MyCleanup.RunSync();  // idempotent
+        Application.Current?.Shutdown();
+    }
+}
+```
+
+Pour les cleanups longs (> 100ms) : retourner `CanCloseDecision.Busy("Description...", estimatedMs)`,
+exécuter le cleanup async fire-and-forget, envoyer `WpsModule.ReportBusyProgress(...)` toutes
+les ~3s pendant le travail, puis `WpsModule.ResolveCanClose(CanCloseDecision.Ok)` à la fin.
+
+Pour les dialogs utilisateurs (genre "Voulez-vous sauvegarder ?") : retourner
+`CanCloseDecision.NeedUser("...")`. Le host bascule l'onglet et donne le focus, l'app affiche
+son dialog, puis appelle `ResolveCanClose(Ok)` ou `ResolveCanClose(Rejected("annulé"))` selon
+la décision de l'utilisateur. Si Rejected, le host annule sa fermeture en cascade.
+
+Ne PAS oublier `WpsModule.Register(this)` (Module) ou `WpsModuleService.Register(this)`
+(ModuleService) au début du Bootstrap — sans ça les hooks ne sont pas appelés et le SDK
+utilise les DIMs (Ok par défaut, comportement v1.2).
+
 ### Étape 6 — Build
 
 Lancer `dotnet build` sur le csproj pour valider :
@@ -198,6 +238,15 @@ Résumer :
   du projet. Calculer à partir du chemin absolu du csproj. Si l'app est dans
   `dev/wipiSoft/MonApp/MonApp.csproj`, le chemin est `..\..\_SDKs\Modules\`. Si elle est dans
   `dev/wipiSoft/MonProject/MonApp/MonApp.csproj`, c'est `..\..\..\_SDKs\Modules\`.
+
+- **(v1.3) Cleanup applicatif laissé dans `OnShutdownRequested`** quand il dure > 100ms : à
+  déplacer proactivement dans `OnCanCloseRequestedAsync` (avant le `return Ok`) pour bénéficier
+  de la fenêtre de négociation du host. Sinon le grace period 7s côté SDK Host peut shooter
+  le cleanup applicatif si la machine swappe ou que d'autres modules ralentissent la cascade.
+
+- **(v1.3) Oubli du `Register(this)`** au début du Bootstrap : les hooks ne sont pas appelés,
+  on retombe sur le comportement v1.2 (CLOSE direct, pas de phase CAN_CLOSE). Symptôme : le
+  cleanup applicatif n'est pas proactif.
 
 - **Mutex singleton oublié dans le branchement standalone** : si l'app avait un mutex,
   le préserver mais le rendre conditionnel à `!WpsModuleService.IsEmbedded`. Sinon le
